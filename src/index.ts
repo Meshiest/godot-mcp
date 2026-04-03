@@ -9,7 +9,9 @@
 
 import { fileURLToPath } from 'url';
 import { join, dirname, basename, normalize } from 'path';
-import { existsSync, readdirSync, mkdirSync } from 'fs';
+import { existsSync, readdirSync, mkdirSync, writeFileSync, readFileSync, copyFileSync } from 'fs';
+import AdmZip from 'adm-zip';
+import axios from 'axios';
 import { spawn, execFile } from 'child_process';
 import { promisify } from 'util';
 
@@ -89,6 +91,10 @@ class GodotServer {
     'directory': 'directory',
     'recursive': 'recursive',
     'scene': 'scene',
+    'asset_id': 'assetId',
+    'godot_version': 'godotVersion',
+    'max_results': 'maxResults',
+    'target_dir': 'targetDir',
   };
 
   /**
@@ -913,6 +919,88 @@ class GodotServer {
             required: ['projectPath'],
           },
         },
+        {
+          name: 'search_assets',
+          description: 'Search the Godot Asset Library for addons and assets',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              filter: {
+                type: 'string',
+                description: 'Search text to filter assets by name or description',
+              },
+              type: {
+                type: 'string',
+                description: 'Asset type: "any", "addon", or "project" (default: "addon")',
+              },
+              godotVersion: {
+                type: 'string',
+                description: 'Godot version filter as major.minor (e.g. "4.3"). Patch is ignored.',
+              },
+              maxResults: {
+                type: 'number',
+                description: 'Maximum results to return (1-500, default: 20)',
+              },
+              sort: {
+                type: 'string',
+                description: 'Sort by: "rating", "name", "updated", or "cost" (default: "updated")',
+              },
+              support: {
+                type: 'string',
+                description: 'Support level filter: "official", "featured", "community", "testing" (join with "+")',
+              },
+              page: {
+                type: 'number',
+                description: 'Page number for pagination (default: 0)',
+              },
+            },
+            required: [],
+          },
+        },
+        {
+          name: 'export_project',
+          description: 'Export a Godot project as a standalone build. Bundles GDExtension DLLs (e.g. GodotSteam) next to the executable. Optionally copies to a target directory.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Path to the Godot project directory',
+              },
+              targetDir: {
+                type: 'string',
+                description: 'Optional: directory to copy the build to (local path or network share)',
+              },
+              preset: {
+                type: 'string',
+                description: 'Export preset name (default: "Windows Desktop")',
+              },
+              release: {
+                type: 'boolean',
+                description: 'Use release mode instead of debug (default: false)',
+              },
+            },
+            required: ['projectPath'],
+          },
+        },
+        {
+          name: 'install_asset',
+          description: 'Install an asset from the Godot Asset Library into a project. Downloads and extracts the asset zip, stripping the top-level directory.',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              projectPath: {
+                type: 'string',
+                description: 'Path to the Godot project directory',
+              },
+              assetId: {
+                type: 'number',
+                description: 'Asset ID from the Godot Asset Library (use search_assets to find IDs)',
+              },
+            },
+            required: ['projectPath', 'assetId'],
+          },
+        },
       ],
     }));
 
@@ -948,6 +1036,12 @@ class GodotServer {
           return await this.handleGetUid(request.params.arguments);
         case 'update_project_uids':
           return await this.handleUpdateProjectUids(request.params.arguments);
+        case 'export_project':
+          return await this.handleExportProject(request.params.arguments);
+        case 'search_assets':
+          return await this.handleSearchAssets(request.params.arguments);
+        case 'install_asset':
+          return await this.handleInstallAsset(request.params.arguments);
         default:
           throw new McpError(
             ErrorCode.MethodNotFound,
@@ -2138,6 +2232,370 @@ class GodotServer {
           'Ensure Godot is installed correctly',
           'Check if the GODOT_PATH environment variable is set correctly',
           'Verify the project path is accessible',
+        ]
+      );
+    }
+  }
+
+  /**
+   * Handle the export_project tool
+   */
+  private async handleExportProject(args: any) {
+    args = this.normalizeParameters(args);
+
+    if (!args.projectPath) {
+      return this.createErrorResponse(
+        'Project path is required',
+        ['Provide a valid path to a Godot project directory']
+      );
+    }
+
+    if (!this.validatePath(args.projectPath)) {
+      return this.createErrorResponse(
+        'Invalid project path',
+        ['Provide a valid path without ".." or other potentially unsafe characters']
+      );
+    }
+
+    const projectFile = join(args.projectPath, 'project.godot');
+    if (!existsSync(projectFile)) {
+      return this.createErrorResponse(
+        `Not a valid Godot project: ${args.projectPath}`,
+        [
+          'Ensure the path points to a directory containing a project.godot file',
+          'Use list_projects to find valid Godot projects',
+        ]
+      );
+    }
+
+    if (!this.godotPath) {
+      await this.detectGodotPath();
+      if (!this.godotPath) {
+        return this.createErrorResponse(
+          'Could not find Godot executable',
+          ['Set GODOT_PATH environment variable']
+        );
+      }
+    }
+
+    try {
+      const projectName = basename(args.projectPath);
+      const preset = args.preset || 'Windows Desktop';
+      const isRelease = args.release === true;
+      const exportFlag = isRelease ? '--export-release' : '--export-debug';
+      const buildDir = join(args.projectPath, 'build');
+      const outputPath = join(buildDir, `${projectName}.exe`);
+
+      // Ensure build directory exists
+      if (!existsSync(buildDir)) {
+        mkdirSync(buildDir, { recursive: true });
+      }
+
+      // Ensure export_presets.cfg exists
+      const presetsPath = join(args.projectPath, 'export_presets.cfg');
+      if (!existsSync(presetsPath)) {
+        const presetsContent = `[preset.0]\n\nname="${preset}"\nplatform="${preset}"\nrunnable=true\ndedicated_server=false\ncustom_features=""\nexport_filter="all_resources"\ninclude_filter=""\nexclude_filter=""\nexport_path="build/${projectName}.exe"\npatches=PackedStringArray()\n\n[preset.0.options]\n\ncustom_template/debug=""\ncustom_template/release=""\nbinary_format/embed_pck=true\n`;
+        writeFileSync(presetsPath, presetsContent, 'utf8');
+        this.logDebug('Created default export_presets.cfg');
+      }
+
+      // Run export
+      this.logDebug(`Exporting project: ${exportFlag} "${preset}" ${outputPath}`);
+      const { stdout, stderr } = await execFileAsync(
+        this.godotPath!,
+        ['--headless', '--path', args.projectPath, exportFlag, preset, outputPath],
+        { timeout: 120000 }
+      );
+
+      if (!existsSync(outputPath)) {
+        return this.createErrorResponse(
+          `Export failed: output file not created`,
+          [
+            'Check that export templates are installed (Editor > Manage Export Templates)',
+            `Stderr: ${stderr}`,
+          ]
+        );
+      }
+
+      // Bundle GDExtension DLLs
+      const copiedFiles: string[] = [basename(outputPath)];
+      const addonsDir = join(args.projectPath, 'addons');
+      if (existsSync(addonsDir)) {
+        const templateType = isRelease ? 'template_release' : 'template_debug';
+        const scanDir = (dir: string) => {
+          const entries = readdirSync(dir, { withFileTypes: true });
+          for (const entry of entries) {
+            const fullPath = join(dir, entry.name);
+            if (entry.isDirectory()) {
+              scanDir(fullPath);
+            } else if (entry.isFile()) {
+              // Copy DLLs that match platform (win64) and steam_api
+              const name = entry.name.toLowerCase();
+              if (
+                (name.endsWith('.dll') && (name.includes('win') || name.includes('steam'))) &&
+                (name.includes(templateType) || name.includes('steam_api'))
+              ) {
+                copyFileSync(fullPath, join(buildDir, entry.name));
+                copiedFiles.push(entry.name);
+              }
+            }
+          }
+        };
+        scanDir(addonsDir);
+      }
+
+      // Copy steam_appid.txt if it exists
+      const steamAppIdPath = join(args.projectPath, 'steam_appid.txt');
+      if (existsSync(steamAppIdPath)) {
+        copyFileSync(steamAppIdPath, join(buildDir, 'steam_appid.txt'));
+        copiedFiles.push('steam_appid.txt');
+      }
+
+      // Copy to target directory if specified
+      let targetFiles: string[] = [];
+      if (args.targetDir) {
+        if (!existsSync(args.targetDir)) {
+          mkdirSync(args.targetDir, { recursive: true });
+        }
+        for (const file of copiedFiles) {
+          const src = join(buildDir, file);
+          if (existsSync(src)) {
+            copyFileSync(src, join(args.targetDir, file));
+            targetFiles.push(file);
+          }
+        }
+      }
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                success: true,
+                buildDir,
+                files: copiedFiles,
+                targetDir: args.targetDir || null,
+                targetFiles: targetFiles.length > 0 ? targetFiles : undefined,
+                mode: isRelease ? 'release' : 'debug',
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    } catch (error: any) {
+      return this.createErrorResponse(
+        `Failed to export project: ${error?.message || 'Unknown error'}`,
+        [
+          'Ensure Godot export templates are installed for this version',
+          'Check that the export preset name matches one in export_presets.cfg',
+          'Ensure you have write permissions to the build directory',
+        ]
+      );
+    }
+  }
+
+  /**
+   * Handle the search_assets tool
+   */
+  private async handleSearchAssets(args: any) {
+    args = this.normalizeParameters(args);
+
+    try {
+      const params = new URLSearchParams();
+      if (args.filter) params.set('filter', args.filter);
+      params.set('type', args.type || 'addon');
+      if (args.godotVersion) params.set('godot_version', args.godotVersion);
+      params.set('max_results', String(args.maxResults || 20));
+      if (args.sort) params.set('sort', args.sort);
+      if (args.support) params.set('support', args.support);
+      if (args.page !== undefined) params.set('page', String(args.page));
+
+      const url = `https://godotengine.org/asset-library/api/asset?${params.toString()}`;
+      this.logDebug(`Searching asset library: ${url}`);
+
+      const response = await axios.get(url);
+      const data = response.data;
+
+      const results = (data.result || []).map((asset: any) => ({
+        assetId: asset.asset_id,
+        title: asset.title,
+        author: asset.author,
+        category: asset.category,
+        godotVersion: asset.godot_version,
+        rating: asset.rating,
+        cost: asset.cost,
+        supportLevel: asset.support_level,
+        versionString: asset.version_string,
+        modifyDate: asset.modify_date,
+      }));
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                results,
+                page: data.page,
+                pages: data.pages,
+                totalItems: data.total_items,
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    } catch (error: any) {
+      return this.createErrorResponse(
+        `Failed to search asset library: ${error?.message || 'Unknown error'}`,
+        [
+          'Check your internet connection',
+          'The Godot Asset Library API may be temporarily unavailable',
+        ]
+      );
+    }
+  }
+
+  /**
+   * Handle the install_asset tool
+   */
+  private async handleInstallAsset(args: any) {
+    args = this.normalizeParameters(args);
+
+    if (!args.projectPath || args.assetId === undefined) {
+      return this.createErrorResponse(
+        'Project path and asset ID are required',
+        ['Use search_assets to find an asset ID, then provide it with a project path']
+      );
+    }
+
+    if (!this.validatePath(args.projectPath)) {
+      return this.createErrorResponse(
+        'Invalid project path',
+        ['Provide a valid path without ".." or other potentially unsafe characters']
+      );
+    }
+
+    const projectFile = join(args.projectPath, 'project.godot');
+    if (!existsSync(projectFile)) {
+      return this.createErrorResponse(
+        `Not a valid Godot project: ${args.projectPath}`,
+        [
+          'Ensure the path points to a directory containing a project.godot file',
+          'Use list_projects to find valid Godot projects',
+        ]
+      );
+    }
+
+    try {
+      // Fetch asset details
+      const detailUrl = `https://godotengine.org/asset-library/api/asset/${args.assetId}`;
+      this.logDebug(`Fetching asset details: ${detailUrl}`);
+      const detailResponse = await axios.get(detailUrl);
+      const asset = detailResponse.data;
+
+      if (!asset.download_url) {
+        return this.createErrorResponse(
+          `Asset ${args.assetId} has no download URL`,
+          ['The asset may have been removed or is not available for download']
+        );
+      }
+
+      this.logDebug(`Downloading asset: ${asset.title} from ${asset.download_url}`);
+
+      // Download the zip
+      const zipResponse = await axios.get(asset.download_url, {
+        responseType: 'arraybuffer',
+        maxRedirects: 5,
+      });
+
+      const zip = new AdmZip(Buffer.from(zipResponse.data));
+      const entries = zip.getEntries();
+
+      if (entries.length === 0) {
+        return this.createErrorResponse(
+          'Downloaded zip is empty',
+          ['The asset download may be corrupted', 'Try again or report the issue to the asset author']
+        );
+      }
+
+      // Detect if there's a single root directory to strip (GitHub archive pattern)
+      const topLevelDirs = new Set<string>();
+      for (const entry of entries) {
+        const firstSegment = entry.entryName.split('/')[0];
+        topLevelDirs.add(firstSegment);
+      }
+
+      const stripRoot = topLevelDirs.size === 1;
+      const rootPrefix = stripRoot ? [...topLevelDirs][0] + '/' : '';
+
+      this.logDebug(`Zip has ${entries.length} entries, stripRoot=${stripRoot}, rootPrefix="${rootPrefix}"`);
+
+      // Extract entries into the project directory
+      let extractedCount = 0;
+      for (const entry of entries) {
+        let targetPath = entry.entryName;
+
+        // Strip the root directory if needed
+        if (stripRoot) {
+          if (!targetPath.startsWith(rootPrefix)) continue;
+          targetPath = targetPath.substring(rootPrefix.length);
+        }
+
+        // Skip empty paths (the root directory itself)
+        if (!targetPath || targetPath === '/') continue;
+
+        const fullPath = join(args.projectPath, targetPath);
+
+        if (entry.isDirectory) {
+          if (!existsSync(fullPath)) {
+            mkdirSync(fullPath, { recursive: true });
+          }
+        } else {
+          // Ensure parent directory exists
+          const parentDir = dirname(fullPath);
+          if (!existsSync(parentDir)) {
+            mkdirSync(parentDir, { recursive: true });
+          }
+          writeFileSync(fullPath, entry.getData());
+          extractedCount++;
+        }
+      }
+
+      return {
+        content: [
+          {
+            type: 'text',
+            text: JSON.stringify(
+              {
+                success: true,
+                asset: {
+                  id: asset.asset_id,
+                  title: asset.title,
+                  author: asset.author,
+                  version: asset.version_string,
+                  license: asset.cost,
+                },
+                extractedFiles: extractedCount,
+                projectPath: args.projectPath,
+              },
+              null,
+              2
+            ),
+          },
+        ],
+      };
+    } catch (error: any) {
+      return this.createErrorResponse(
+        `Failed to install asset: ${error?.message || 'Unknown error'}`,
+        [
+          'Check your internet connection',
+          'Verify the asset ID is correct (use search_assets to find valid IDs)',
+          'Ensure you have write permissions to the project directory',
         ]
       );
     }

@@ -74,6 +74,12 @@ Godot MCP enables AI agents to launch the Godot editor, run projects, capture de
   - Load sprites and textures into Sprite2D nodes
   - Export 3D scenes as MeshLibrary resources for GridMap
   - Save scenes with options for creating variants
+- **Asset Library**:
+  - Search the Godot Asset Library for addons and projects with filtering and sorting
+  - Install assets directly into a project by asset ID
+- **Export**:
+  - Export projects as standalone builds with GDExtension DLL bundling
+  - Optionally copy builds to a target directory (local or network share)
 - **UID Management** (for Godot 4.4+):
   - Get UID for specific files
   - Update UID references by resaving resources
@@ -129,7 +135,10 @@ Add to your Cline MCP settings file (`~/Library/Application Support/Code/User/gl
         "export_mesh_library",
         "save_scene",
         "get_uid",
-        "update_project_uids"
+        "update_project_uids",
+        "search_assets",
+        "install_asset",
+        "export_project"
       ]
     }
   }
